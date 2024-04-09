@@ -1,7 +1,8 @@
-use std::{error::Error, fs::File, io::{self, Write}};
+use std::{error::Error, fs, io};
 use reqwest::{header::USER_AGENT, blocking::Client};
 use serde::Deserialize;
 use clap::{Parser, Subcommand};
+use whoami::Platform;
 
 #[derive(Parser)]
 struct Cli {
@@ -12,31 +13,33 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Search {
-        #[arg(short, long)]
+        #[arg(short, long, help="The string to search for matching mods")]
         query: String,
-        #[arg(short, long)]
+        #[arg(short, long, help="Categories like \"optimization\", the modloader also goes here")]
         categories: Option<Vec<String>>,
-        #[arg(short='v', long="gameversion")]
+        #[arg(short='v', long="gameversion", help="The Minecraft version to search mods for")]
         game_version: String
     },
     Download {
-        #[arg(short, long)]
+        #[arg(short, long, help="The project to download, can be a slug, e.g. \"sodium\", or a id, e.g. \"AABBCC\"")]
         project: String,
-        #[arg(short = 'v', long)]
+        #[arg(short = 'v', long, help="The targeted Minecraft version for the downloaded mod")]
         game_version: String,
-        #[arg(short, long)]
-        loader: String 
+        #[arg(short, long, help="The modloader for the mod")]
+        loader: String,
+        #[arg(long="mcdir", help="Use if you want to install the mod in the .minecraft\\mods folder")]
+        minecraft_dir: bool
     },
     Info {
-        #[arg(short, long)]
+        #[arg(short, long, help="The project to get the desc of, can be a slug or an id")]
         project: String,
     },
     Dependencies {
-        #[arg(short, long)]
+        #[arg(short, long, help="The targeted project for getting the dependencies")]
         project: String,
-        #[arg(short = 'v', long)]
+        #[arg(short = 'v', long, help="The Minecraft version of the targeted mod")]
         game_version: String,
-        #[arg(short, long)]
+        #[arg(short, long, help="The loader of the targeted mod")]
         loader: String,
     }
 }
@@ -63,13 +66,11 @@ struct Hit {
 }
 
 #[derive(Deserialize)]
-struct ProjectVersions {
-     loaders: Vec<String>,
-     project_id: Vec<String>,
+struct ProjectVersion {
      dependencies: Vec<ProjectDependency>
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct ProjectDependency {
     project_id: String,
     dependency_type: String,
@@ -88,6 +89,9 @@ struct GameFiles {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if check_for_mods_dir().is_empty() {
+        println!("Couldn't find the .mincraft directory, mods won't be installed there even if asked for");
+    }
     let client = Client::new();
 
     let cli = Cli::parse();
@@ -96,9 +100,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             search_mods(query, game_version, categories.as_ref().unwrap().to_vec(), &client)
         },
 
-        Some(Commands::Download { project, game_version, loader }) => {
+        Some(Commands::Download { project, game_version, loader, minecraft_dir }) => {
             let game_files = get_download_link(project, loader, game_version, &client);
-            download_jar(game_files.unwrap(), &client)
+            download_jar(game_files.unwrap(), &client, *minecraft_dir)
         },
 
         Some(Commands::Info { project }) => {
@@ -106,17 +110,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
 
         Some(Commands::Dependencies { project, game_version, loader }) => {
-            let dependencies = project_dependencies(project, loader, game_version, &client);
-            let processed_dependencies = match dependencies {
-                Ok(dep) => dep,
-                Err(e) => {
-                    println!("{}", e);
-                    return Err(e);
-                }
-            };
-            for dependency in processed_dependencies.iter() {
-                println!("{}, {}", dependency.dependency_type, get_project(&dependency.project_id, &client).unwrap().title);
-            };
+            let _ = project_dependencies(project, loader, game_version, &client);
             Ok(())
         }
 
@@ -176,18 +170,19 @@ fn search_mods(query: &str, game_version: &str, categories: Vec<String>, client:
     Err(Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No matching GameFiles found")))
 }
 
-fn project_dependencies(project: &str, loader: &str, game_version: &str, client: &Client) -> Result<Vec<ProjectDependency>, Box<dyn Error>> {
+fn project_dependencies(project: &str, loader: &str, game_version: &str, client: &Client) -> Result<(), Box<dyn Error>> {
     let resp = client.get(format!("https://api.modrinth.com/v2/project/{}/version?loader=[\"{}\"]&game_versions=[\"{}\"]", project, loader, game_version))
         .header(USER_AGENT, "https://github.com/Tomyatana/Pydrinth/tree/Rustdrynth").send()?;
-    let processed_resp: Result<ProjectVersions, serde_json::Error> = serde_json::from_str(&resp.text()?);
+    let resp_txt = resp.text()?;
+    let processed_resp: Result<Vec<ProjectVersion>, serde_json::Error> = serde_json::from_str(&resp_txt);
     match processed_resp {
         Ok(prj_versions) => {
-            if !prj_versions.dependencies.is_empty(){
-                for dependency in prj_versions.dependencies.iter() {
+            let first_prj_v = prj_versions.first().unwrap();
+            if !first_prj_v.dependencies.is_empty(){
+                for dependency in first_prj_v.dependencies.iter() {
                     let dependency_project = get_project(&dependency.project_id, client).unwrap();
-                    print!("\"{}\" - {}", dependency_project.title, dependency_project.slug)
-                }
-                return Ok(prj_versions.dependencies);
+                    println!("{}: \"{}\" - {}", dependency.dependency_type, dependency_project.title, dependency_project.slug)
+                };
             } else {
                 println!("No dependencies found on this project's version");
                 return Err(Box::new(io::Error::new(io::ErrorKind::NotFound, "No dependencies found for this project's version")));
@@ -198,6 +193,7 @@ fn project_dependencies(project: &str, loader: &str, game_version: &str, client:
             return Err(Box::new(e))
         }
     };
+    Ok(())
 }
 
 fn project_info(project: &str, client: &Client) -> Result<(), Box<dyn Error>> {
@@ -241,14 +237,18 @@ fn get_download_link(slug: &str, loader: &str, game_version: &str, client: &Clie
     Err(Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No matching GameFiles found")))
 }
 
-fn download_jar(game_files: GameFiles, client: &Client) -> Result<(), Box<dyn Error>>{
-    let resp = client.get(game_files.url).header(USER_AGENT, "https://github.com/Tomyatana/Pydrinth/tree/Rustdrynth").send()?;
+fn download_jar(game_files: GameFiles, client: &Client, mcdir: bool) -> Result<(), Box<dyn Error>>{
+    println!("Downloading {} from {}", game_files.filename, game_files.url);
+    let resp = client.get(&game_files.url).header(USER_AGENT, "https://github.com/Tomyatana/Pydrinth/tree/Rustdrynth").send()?;
     if resp.status().is_success() {
         let bytes = resp.bytes();
-        let jar = File::create(game_files.filename);
-        let _ = jar.expect("Couldn't download file").write_all(bytes?.as_ref());
+        if !check_for_mods_dir().is_empty() && mcdir {
+                let _ = fs::write(format!("{}/{}", check_for_mods_dir(), game_files.filename), bytes?.as_ref());
+        } else {
+            let _ = fs::write(game_files.filename, bytes?.as_ref());
+        }
     } else {
-        println!("Failed to download file");
+        println!("Couldn't get file from {}", &game_files.url);
     }
     Ok(())
 }
@@ -276,4 +276,33 @@ fn remove_last_char(string: &str, char: char) -> String {
     } else {
         string.to_string()
     }
+}
+
+fn check_for_mods_dir() -> String{
+    let user = whoami::username();
+    let platform = whoami::platform();
+    match platform {
+        Platform::Windows => {
+            if fs::metadata(format!("C:/Users/{}/AppData/Roaming/.minecraft", user)).is_ok() {
+                if fs::metadata(format!("C:/Users/{}/AppData/Roaming/.minecraft/mods", user)).is_ok() {
+                    return String::from(format!("C:/Users/{}/AppData/Roaming/.minecraft/mods", user));
+                } else {
+                    let _ = fs::create_dir(format!("C:/Users/{}/AppData/Roaming/.minecraft/mods", user));
+                    return format!("C:/Users/{}/AppData/Roaming/.minecraft/mods", user).to_string();
+                }
+            }
+        },
+        Platform::Linux => {
+            if fs::metadata("~/.minecraft").is_ok() {
+                if fs::metadata("~/.minecraft/mods").is_ok() {
+                    return String::from("~/.minecraft/mods")
+                } else {
+                    let _ = fs::create_dir("~/.minecraft/mods");
+                    return "~/.minecraft/mods".to_string();
+                }
+            }
+        }
+        _ => return "".to_string()
+    }
+    "".to_string()
 }
