@@ -293,12 +293,12 @@ fn check_for_mods_dir() -> String{
             }
         },
         Platform::Linux => {
-            if fs::metadata("~/.minecraft").is_ok() {
-                if fs::metadata("~/.minecraft/mods").is_ok() {
-                    return String::from("~/.minecraft/mods")
+            if fs::metadata(format!("{}/.minecraft", dirs::home_dir().unwrap().display())).is_ok() {
+                if fs::metadata(format!("{}/.minecraft/mods", dirs::home_dir().unwrap().display())).is_ok() {
+                    return String::from(format!("{}/.minecraft/mods", dirs::home_dir().unwrap().display()))
                 } else {
-                    let _ = fs::create_dir("~/.minecraft/mods");
-                    return "~/.minecraft/mods".to_string();
+                    let _ = fs::create_dir(format!("{}/.minecraft/mods", dirs::home_dir().unwrap().display()));
+                    return format!("{}/.minecraft/mods", dirs::home_dir().unwrap().display()).to_string();
                 }
             }
         }
